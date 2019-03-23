@@ -147,8 +147,37 @@ let maybe = (el, key) => {
   }
 }
 
-let serializeForm = (form) => {
-  return((new URLSearchParams(new FormData(form))).toString())
+let serializeForm = (form, callback) => {
+  const formData = new FormData(form)
+  let useBinary = false
+  formData.forEach((val, key) => {
+    if (val instanceof File && val.size > 0) {
+      useBinary = true
+    }
+  })
+
+  if (!useBinary) {
+    callback((new URLSearchParams(formData)).toString())
+  } else {
+    let values = {}
+    let readerCount = 0
+    formData.forEach((val, key) => {
+      if (val instanceof File && val.size > 0) {
+        var reader = new FileReader()
+        readerCount++
+        reader.onload = function(e) {
+          values[key] = {file: e.target.result, filename: val.name, type: val.type}
+          if(--readerCount === 0) {
+            callback(values, true)
+          }
+        }
+        reader.readAsArrayBuffer(val)
+        useBinary = true
+      } else {
+        values[key] = val
+      }
+    })
+  }
 }
 
 let recursiveMerge = (target, source) => {
@@ -214,6 +243,70 @@ let Rendered = {
   }
 }
 
+function writeBinaryString(view, string, offset) {
+  let i = 0;
+  for (i; i < string.length; i++) {
+    view.setUint8(offset + i, string.charCodeAt(i))
+  }
+  return offset + i;
+}
+
+function binaryEncode(message , cb) {
+  const { join_ref, ref, payload: { event, value } } = message
+  const numParts = Object.keys(value).length;
+  const headerLength = 2;
+  const metaLength = 3 + join_ref.length + event.length + ref.length;
+  const parts = Object.entries(value);
+
+  const partLength = parts.reduce((acc, [key, val]) => {
+    if (val.file) {
+      console.log(1 + 1 + 2 + 4 + key.length + val.filename.length + val.type.length + 3);
+      return acc + 8 + key.length + val.filename.length + val.type.length + 3 + val.file.byteLength;
+    } else {
+      return acc + 4 + key.length + val.length
+    }
+  }, 0);
+
+  // TODO: work out where 12 is coming from
+  const buffer = new ArrayBuffer(headerLength + metaLength + partLength + 12);
+
+  const view = new DataView(buffer);
+  view.setUint8(0, 4) // TODO: consider parts here
+  view.setUint8(1, numParts)
+  view.setUint8(2, event.length)
+  view.setUint8(3, ref.length)
+  view.setUint8(4, join_ref.length)
+  let offset = writeBinaryString(view, event, 5)
+  offset = writeBinaryString(view, ref, offset)
+  offset = writeBinaryString(view, join_ref, offset)
+
+  parts.forEach(([key, val]) => {
+    if (val.file) {
+      const metadata = `filename=${val.filename}&type=${val.type}`
+      view.setUint8(offset, 1)
+      view.setUint8(offset + 1, key.length)
+      view.setUint16(offset + 2, metadata.length, false)
+      console.log(metadata.length + 1 + 1 + 2 + 4);
+      view.setUint32(offset + 4, val.file.byteLength, false)
+      offset = writeBinaryString(view, key, offset + 8)
+      offset = writeBinaryString(view, metadata, offset)
+      let i = 0;
+      const arr = new Uint8Array(val.file);
+      for (0; i < val.file.byteLength; i++) {
+        view.setUint8(offset + i, arr[i]);
+      }
+      return offset + i;
+    }
+    view.setUint8(offset, 0)
+    view.setUint8(offset + 1, key.length)
+    view.setUint16(offset + 2, val.length)
+    offset = writeBinaryString(view, key, offset + 4)
+    offset = writeBinaryString(view, val, offset)
+  })
+
+  cb(view.buffer);
+}
+
 // todo document LiveSocket specific options like viewLogger
 export class LiveSocket {
   constructor(urlOrSocket, opts = {}){
@@ -222,7 +315,18 @@ export class LiveSocket {
       this.unloaded = true
     })
     this.socket = this.buildSocket(urlOrSocket, opts)
-    this.socket.onOpen(() => this.unloaded = false)
+    this.socket.onOpen(() => {
+      this.unloaded = false
+      this.socket.conn.binaryType = "arraybuffer"
+    })
+    const encode = this.socket.encode
+    this.socket.encode = function(message, cb) {
+      if (message.payload.type === "binary") {
+        binaryEncode(message, cb)
+      } else {
+        encode(message, cb)
+      }
+    }
     this.bindingPrefix = opts.bindingPrefix || BINDING_PREFIX
     this.opts = opts
     this.views = {}
@@ -715,10 +819,22 @@ class View {
   }
 
   pushInput(inputEl, phxEvent){
-    this.pushWithReply("event", {
-      type: "form",
-      event: phxEvent,
-      value: serializeForm(inputEl.form)
+    window.channel = this.channel;
+    serializeForm(inputEl.form, (form, useBinary) => {
+
+      if (useBinary) {
+        this.pushWithReply("event", {
+          type: "binary",
+          event: phxEvent,
+          value: form
+        })
+      }
+
+      this.pushWithReply("event", {
+        type: "form",
+        event: phxEvent,
+        value: form
+      })
     })
   }
 
